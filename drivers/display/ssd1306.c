@@ -440,9 +440,87 @@ static int ssd1306_init(const struct device *dev)
 	return 0;
 }
 
+static int ssd1306_re_init(const struct device *dev)
+{
+	LOG_DBG("ssd1306 oled re-init now");
+
+	// Note: uncoment below for full re-init
+	return ssd1306_init(dev);
+
+	// Note: Below list is minimal working set experimentally:
+
+// 	if (ssd1306_set_charge_pump(dev)) {
+// 		return -EIO;
+// 	}
+
+// 	uint8_t cmd_buf[] = {
+// 		SSD1306_SET_ENTIRE_DISPLAY_OFF,
+// #ifdef CONFIG_SSD1306_REVERSE_MODE
+// 		SSD1306_SET_REVERSE_DISPLAY,
+// #else
+// 		SSD1306_SET_NORMAL_DISPLAY,
+// #endif
+// 	};
+
+// 	if (ssd1306_write_bus(dev, cmd_buf, sizeof(cmd_buf), true)) {
+// 		LOG_ERR("ssd1306_write_bus");
+// 		return -EIO;
+// 	}
+
+// 	if (ssd1306_set_contrast(dev, CONFIG_SSD1306_DEFAULT_CONTRAST)) {
+// 		return -EIO;
+// 	}
+
+// 	ssd1306_resume(dev);
+
+// 	return 0;
+}
+
+static int ext_power_status = true;
+
+static int ssd1306_update_ext_power(const struct device *dev, bool ext_power_status_new_value) {
+
+	// minimum sleep needed when waking up
+	if (ext_power_status_new_value == true) {
+		k_sleep(K_MSEC(30));
+	}
+
+	// first update to I2C
+	if (dev->data != NULL) {
+		struct ssd1306_data *driver = dev->data;
+		if (driver->bus != NULL) {
+			if(i2c_update_ext_power(driver->bus, ext_power_status_new_value)) {
+				LOG_ERR("Failed i2c_update_ext_power!");
+				return -EIO;
+			}
+		} else {
+			LOG_ERR("I2C bus is NULL");
+		}
+	} else {
+		LOG_ERR("display data is NULL");
+	}
+	
+	if (ext_power_status != ext_power_status_new_value) {
+		if (ext_power_status_new_value == true)
+		{
+			// sleep after I2C reset
+			k_sleep(K_MSEC(30));
+
+			// re-init oled, sends commands through i2c bus
+			ssd1306_re_init(dev);
+		} else {
+			// no-op for now
+		}
+
+		ext_power_status = ext_power_status_new_value;
+	}
+	return 0;
+}
+
 static struct ssd1306_data ssd1306_driver;
 
 static struct display_driver_api ssd1306_driver_api = {
+	.update_ext_power = ssd1306_update_ext_power,
 	.blanking_on = ssd1306_suspend,
 	.blanking_off = ssd1306_resume,
 	.write = ssd1306_write,
@@ -455,7 +533,9 @@ static struct display_driver_api ssd1306_driver_api = {
 	.set_orientation = ssd1306_set_orientation,
 };
 
+#define DISPLAY_INIT_PRIORITY 95
+
 DEVICE_DT_INST_DEFINE(0, ssd1306_init, device_pm_control_nop,
 		    &ssd1306_driver, NULL,
-		    POST_KERNEL, CONFIG_APPLICATION_INIT_PRIORITY,
+		    POST_KERNEL, DISPLAY_INIT_PRIORITY,
 		    &ssd1306_driver_api);

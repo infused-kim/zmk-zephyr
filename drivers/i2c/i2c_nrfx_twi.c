@@ -189,13 +189,13 @@ static int i2c_nrfx_twi_configure(const struct device *dev,
 	return 0;
 }
 
-static const struct i2c_driver_api i2c_nrfx_twi_driver_api = {
-	.configure = i2c_nrfx_twi_configure,
-	.transfer  = i2c_nrfx_twi_transfer,
-};
+
+static int initialized = false;
 
 static int init_twi(const struct device *dev)
 {
+	LOG_WRN("init_twi");
+
 	struct i2c_nrfx_twi_data *dev_data = get_dev_data(dev);
 	nrfx_err_t result = nrfx_twi_init(&get_dev_config(dev)->twi,
 					  &get_dev_config(dev)->config,
@@ -209,14 +209,44 @@ static int init_twi(const struct device *dev)
 	get_dev_data(dev)->pm_state = DEVICE_PM_ACTIVE_STATE;
 #endif
 
+	initialized = true;
 	return 0;
 }
+
+
+static int i2c_nrfx_twi_update_ext_power(const struct device *dev, bool ext_power_enabled) {
+	LOG_WRN("I2C update_ext_power now");
+	if(ext_power_enabled) {
+		LOG_WRN("New state power on, re-init");
+		if (!initialized) {
+			nrfx_twi_uninit(&get_dev_config(dev)->twi);
+			init_twi(dev);
+			// if (get_dev_data(dev)->dev_config) {
+			// 	i2c_nrfx_twi_configure(
+			// 		dev,
+			// 		get_dev_data(dev)->dev_config);
+			// }
+		}
+	} else {
+		if (initialized) {
+			initialized = false;
+		}
+	}
+	return 0;
+}
+
+static const struct i2c_driver_api i2c_nrfx_twi_driver_api = {
+	.update_ext_power = i2c_nrfx_twi_update_ext_power,
+	.configure = i2c_nrfx_twi_configure,
+	.transfer  = i2c_nrfx_twi_transfer,
+};
 
 #ifdef CONFIG_PM_DEVICE
 static int twi_nrfx_pm_control(const struct device *dev,
 				uint32_t ctrl_command,
 				void *context, device_pm_cb cb, void *arg)
 {
+	LOG_WRN("twi_nrfx_pm_control");
 	int ret = 0;
 	uint32_t pm_current_state = get_dev_data(dev)->pm_state;
 
@@ -226,19 +256,25 @@ static int twi_nrfx_pm_control(const struct device *dev,
 		if (new_state != pm_current_state) {
 			switch (new_state) {
 			case DEVICE_PM_ACTIVE_STATE:
-				init_twi(dev);
-				if (get_dev_data(dev)->dev_config) {
-					i2c_nrfx_twi_configure(
-						dev,
-						get_dev_data(dev)->dev_config);
+				if (!initialized) {
+					init_twi(dev);
+					if (get_dev_data(dev)->dev_config) {
+						i2c_nrfx_twi_configure(
+							dev,
+							get_dev_data(dev)->dev_config);
+					}
 				}
 				break;
 
 			case DEVICE_PM_LOW_POWER_STATE:
 			case DEVICE_PM_SUSPEND_STATE:
 			case DEVICE_PM_OFF_STATE:
+				LOG_WRN("DEVICE_PM_OFF_STATE DEVICE_PM_SUSPEND_STATE DEVICE_PM_LOW_POWER_STATE");
 				if (pm_current_state == DEVICE_PM_ACTIVE_STATE) {
-					nrfx_twi_uninit(&get_dev_config(dev)->twi);
+					if (initialized) {
+						nrfx_twi_uninit(&get_dev_config(dev)->twi);
+						initialized = false;
+					}
 				}
 				break;
 
