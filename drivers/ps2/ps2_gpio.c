@@ -10,6 +10,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/ps2.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
 #define LOG_LEVEL CONFIG_PS2_LOG_LEVEL
@@ -21,6 +22,8 @@ LOG_MODULE_REGISTER(ps2_gpio);
 
 #define PS2_GPIO_WRITE_MAX_RETRY 5
 #define PS2_GPIO_READ_MAX_RETRY  3
+
+#define PS2_GPIO_DATA_QUEUE_SIZE 100
 
 // Custom queue for background PS/2 processing work at low priority
 // We purposefully want this to be a fairly low priority, because
@@ -141,6 +144,10 @@ typedef enum {
 	PS2_GPIO_WRITE_STATUS_FAILURE,
 } ps2_gpio_write_status;
 
+struct ps2_gpio_data_queue_item {
+	uint8_t byte;
+};
+
 struct ps2_gpio_config {
 	struct gpio_dt_spec scl_gpio;
 	struct gpio_dt_spec sda_gpio;
@@ -163,7 +170,8 @@ struct ps2_gpio_data {
 	bool callback_enabled;
 
 	// Queue for ps2_read()
-	struct k_fifo data_queue;
+	struct k_msgq data_queue;
+	char data_queue_buffer[PS2_GPIO_DATA_QUEUE_SIZE * sizeof(struct ps2_gpio_data_queue_item)];
 
 	ps2_gpio_mode mode;
 
@@ -268,18 +276,20 @@ int ps2_gpio_set_scl_callback_enabled(bool enabled)
 	int err;
 
 	if (enabled) {
-		err = gpio_add_callback(data->scl_gpio.port, &data->scl_cb_data);
+		err = gpio_pin_interrupt_configure_dt(&data->scl_gpio, (GPIO_INT_EDGE_FALLING));
 		if (err) {
-			LOG_ERR("failed to enable interrupt callback on "
+			LOG_ERR("failed to enable interrupt on "
 				"SCL GPIO pin (err %d)",
 				err);
+			return err;
 		}
 	} else {
-		err = gpio_remove_callback(data->scl_gpio.port, &data->scl_cb_data);
+		err = gpio_pin_interrupt_configure_dt(&data->scl_gpio, (GPIO_INT_DISABLE));
 		if (err) {
-			LOG_ERR("failed to disable interrupt callback on "
+			LOG_ERR("failed to disable interrupt on "
 				"SCL GPIO pin (err %d)",
 				err);
+			return err;
 		}
 	}
 
@@ -306,7 +316,7 @@ int ps2_gpio_configure_pin_scl_input()
 
 int ps2_gpio_configure_pin_scl_output()
 {
-	return ps2_gpio_configure_pin_scl((GPIO_OUTPUT), "output");
+	return ps2_gpio_configure_pin_scl((GPIO_OUTPUT_HIGH), "output");
 }
 
 int ps2_gpio_configure_pin_sda(gpio_flags_t flags, char *descr)
@@ -329,7 +339,7 @@ int ps2_gpio_configure_pin_sda_input()
 
 int ps2_gpio_configure_pin_sda_output()
 {
-	return ps2_gpio_configure_pin_sda((GPIO_OUTPUT), "output");
+	return ps2_gpio_configure_pin_sda((GPIO_OUTPUT_HIGH), "output");
 }
 
 bool ps2_gpio_get_byte_parity(uint8_t byte)
@@ -344,56 +354,53 @@ bool ps2_gpio_get_byte_parity(uint8_t byte)
 uint8_t ps2_gpio_data_queue_get_next(uint8_t *dst_byte, k_timeout_t timeout)
 {
 	struct ps2_gpio_data *data = &ps2_gpio_data;
+	struct ps2_gpio_data_queue_item queue_data;
+	int ret;
 
-	uint8_t *queue_byte = k_fifo_get(&data->data_queue, timeout);
-	if (queue_byte == NULL) {
+	ret = k_msgq_get(&data->data_queue, &queue_data, timeout);
+	if (ret != 0) {
+		LOG_WRN("Data queue timed out...");
 		return -ETIMEDOUT;
 	}
 
-	*dst_byte = *queue_byte;
-
-	k_free(queue_byte);
+	*dst_byte = queue_data.byte;
 
 	return 0;
 }
 
 void ps2_gpio_data_queue_empty()
 {
-	while (true) {
-		uint8_t byte;
-		int err = ps2_gpio_data_queue_get_next(&byte, K_NO_WAIT);
-		if (err) { // No more items in queue
-			break;
-		}
-	}
+	struct ps2_gpio_data *data = &ps2_gpio_data;
+
+	k_msgq_purge(&data->data_queue);
 }
 
 void ps2_gpio_data_queue_add(uint8_t byte)
 {
 	struct ps2_gpio_data *data = &ps2_gpio_data;
 
-	uint8_t *byte_heap = (uint8_t *)k_malloc(sizeof(byte));
-	if (byte_heap == NULL) {
-		LOG_WRN("Could not allocate heap space to add byte to fifo. "
-			"Clearing fifo.");
+	int ret;
 
-		// TODO: Define max amount for read data queue instead of emptying it
-		// when memory runs out.
-		// But unfortunately it seems like there is no official way to query
-		// how many items are currently in the fifo.
-		ps2_gpio_data_queue_empty();
+	struct ps2_gpio_data_queue_item queue_data;
+	queue_data.byte = byte;
 
-		byte_heap = (uint8_t *)k_malloc(sizeof(byte));
-		if (byte_heap == NULL) {
-			LOG_ERR("Could not allocate heap space after clearing fifo. "
-				"Losing received byte 0x%x",
-				byte);
-			return;
+	LOG_INF("Adding byte to data queue: 0x%x", byte);
+
+	for (int i = 0; i < 2; i++) {
+		ret = k_msgq_put(&data->data_queue, &queue_data, K_NO_WAIT);
+		if (ret == 0) {
+			break;
+		} else {
+			LOG_WRN("Data queue full. Removing oldest item.");
+
+			uint8_t tmp_byte;
+			ps2_gpio_data_queue_get_next(&tmp_byte, K_NO_WAIT);
 		}
 	}
 
-	*byte_heap = byte;
-	k_fifo_alloc_put(&data->data_queue, byte_heap);
+	if (ret != 0) {
+		LOG_ERR("Failed to add byte 0x%x to the data queue.", byte);
+	}
 }
 
 void ps2_gpio_send_cmd_resend_worker(struct k_work *item)
@@ -695,8 +702,9 @@ void ps2_gpio_interrupt_log_scl_timeout(struct k_work *item)
 		// to send a new clock/interrupt within 100us.
 		// If we don't receive the next interrupt within that timeframe,
 		// we abort the read.
+		struct k_work_delayable *d_work = k_work_delayable_from_work(item);
 		struct ps2_gpio_data *data =
-			CONTAINER_OF(item, struct ps2_gpio_data, read_scl_timout);
+			CONTAINER_OF(d_work, struct ps2_gpio_data, read_scl_timout);
 
 		LOG_PS2_INT("Read SCL timeout", NULL);
 
@@ -843,7 +851,7 @@ void ps2_gpio_interrupt_log_scl_timeout(struct k_work *item)
 // device responded with 0xfc (failure / cancel).
 #define PS2_GPIO_E_WRITE_FAILURE 5
 
-	K_MUTEX_DEFINE(write_mutex);
+	K_MUTEX_DEFINE(ps2_gpio_write_mutex);
 
 	int ps2_gpio_write_byte(uint8_t byte)
 	{
@@ -852,7 +860,7 @@ void ps2_gpio_interrupt_log_scl_timeout(struct k_work *item)
 		LOG_DBG("\n");
 		LOG_DBG("START WRITE: 0x%x", byte);
 
-		k_mutex_lock(&write_mutex, K_FOREVER);
+		k_mutex_lock(&ps2_gpio_write_mutex, K_FOREVER);
 
 		for (int i = 0; i < PS2_GPIO_WRITE_MAX_RETRY; i++) {
 			if (i > 0) {
@@ -876,7 +884,7 @@ void ps2_gpio_interrupt_log_scl_timeout(struct k_work *item)
 		}
 
 		LOG_DBG("END WRITE: 0x%x\n", byte);
-		k_mutex_unlock(&write_mutex);
+		k_mutex_unlock(&ps2_gpio_write_mutex);
 
 		return err;
 	}
@@ -1017,14 +1025,11 @@ void ps2_gpio_interrupt_log_scl_timeout(struct k_work *item)
 		}
 
 		// Configure data and clock lines for output
+		ps2_gpio_set_scl_callback_enabled(false);
 		ps2_gpio_configure_pin_scl_output();
 		ps2_gpio_configure_pin_sda_output();
 
 		LOG_PS2_INT("Starting write of byte ", &byte);
-
-		// Disable interrupt so that we don't trigger it when we
-		// pull the clock low to inhibit the line
-		ps2_gpio_set_scl_callback_enabled(false);
 
 		// Inhibit the line by setting clock low and data high
 		ps2_gpio_set_scl(0);
@@ -1044,8 +1049,9 @@ void ps2_gpio_interrupt_log_scl_timeout(struct k_work *item)
 	{
 		LOG_PS2_INT("Inhibition timer finished", NULL);
 
+		struct k_work_delayable *d_work = k_work_delayable_from_work(item);
 		struct ps2_gpio_data *data =
-			CONTAINER_OF(item, struct ps2_gpio_data, write_inhibition_wait);
+			CONTAINER_OF(d_work, struct ps2_gpio_data, write_inhibition_wait);
 
 		// Enable the scl interrupt again
 		ps2_gpio_set_scl_callback_enabled(true);
@@ -1299,77 +1305,57 @@ void ps2_gpio_interrupt_log_scl_timeout(struct k_work *item)
 	 * PS/2 GPIO Driver Init
 	 */
 
-	int ps2_gpio_configure_scl_pin(struct ps2_gpio_data * data,
-				       const struct ps2_gpio_config *config)
+	static int ps2_gpio_init_gpio(void)
 	{
+		struct ps2_gpio_data *data = &ps2_gpio_data;
+		struct ps2_gpio_config *config = (struct ps2_gpio_config *)&ps2_gpio_config;
 		int err;
 
 		// Make pin info accessible through the data struct
 		data->scl_gpio = config->scl_gpio;
-
-		// Overwrite any user-provided flags from the devicetree
-		data->scl_gpio.dt_flags = 0;
-
-		ps2_gpio_configure_pin_scl_input();
-
-		// Interrupt for clock line
-		err = gpio_pin_interrupt_configure_dt(&data->scl_gpio, (GPIO_INT_EDGE_FALLING));
-		if (err) {
-			LOG_ERR("failed to configure interrupt on "
-				"SCL GPIO pin (err %d)",
-				err);
-			return err;
-		}
-
-		gpio_init_callback(&data->scl_cb_data, ps2_gpio_scl_interrupt_handler,
-				   BIT(data->scl_gpio.pin));
-
-		ps2_gpio_set_scl_callback_enabled(true);
-
-		return 0;
-	}
-
-	int ps2_gpio_configure_sda_pin(struct ps2_gpio_data * data,
-				       const struct ps2_gpio_config *config)
-	{
-		// Make pin info accessible through the data struct
 		data->sda_gpio = config->sda_gpio;
 
 		// Overwrite any user-provided flags from the devicetree
 		data->scl_gpio.dt_flags = 0;
+		data->scl_gpio.dt_flags = 0;
 
+		// Setup interrupt callback for clock line
+		gpio_init_callback(&data->scl_cb_data, ps2_gpio_scl_interrupt_handler,
+				   BIT(data->scl_gpio.pin));
+
+		err = gpio_add_callback(config->scl_gpio.port, &data->scl_cb_data);
+		if (err) {
+			LOG_ERR("failed to enable interrupt callback on "
+				"SCL GPIO pin (err %d)",
+				err);
+		}
+
+		ps2_gpio_set_scl_callback_enabled(true);
+		ps2_gpio_configure_pin_scl_input();
 		ps2_gpio_configure_pin_sda_input();
-
-		return 0;
-	}
-
-	static int ps2_gpio_init(const struct device *dev)
-	{
-
-		struct ps2_gpio_data *data = dev->data;
-		const struct ps2_gpio_config *config = dev->config;
-		int err;
-
-		// Set the ps2 device so we can retrieve it later for
-		// the ps2 callback
-		data->dev = dev;
-
-		err = ps2_gpio_configure_scl_pin(data, config);
-		if (err) {
-			return err;
-		}
-		err = ps2_gpio_configure_sda_pin(data, config);
-		if (err) {
-			return err;
-		}
 
 		// Check if this stuff is needed
 		// TODO: Figure out why this is requiered.
 		ps2_gpio_set_sda(1);
 		ps2_gpio_set_scl(1);
 
-		// Init fifo for synchronous read operations
-		k_fifo_init(&data->data_queue);
+		return err;
+	}
+
+	static int ps2_gpio_init(const struct device *dev)
+	{
+
+		struct ps2_gpio_data *data = dev->data;
+
+		// Set the ps2 device so we can retrieve it later for
+		// the ps2 callback
+		data->dev = dev;
+
+		ps2_gpio_init_gpio();
+
+		// Init data queue for synchronous read operations
+		k_msgq_init(&data->data_queue, data->data_queue_buffer,
+			    sizeof(struct ps2_gpio_data_queue_item), PS2_GPIO_DATA_QUEUE_SIZE);
 
 		// Init semaphore for blocking writes
 		k_sem_init(&data->write_lock, 0, 1);
